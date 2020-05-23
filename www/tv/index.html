@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+</head>
+<body>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@0.13.2/dist/hls.min.js"></script>
+    <video id="stream" controls muted></video>
+    <script>
+        // Get time from a central clock server in UTC; adjusted for RTT.
+        async function getTime() {
+            var xmlParser = new DOMParser();
+            var res = await fetch("https://time.akamai.com/?xml");
+            var start = performance.now();
+            var rawXml = await res.text();
+            var xml = xmlParser.parseFromString(rawXml, "text/xml");
+            var serverTime = parseInt(xml.getElementsByTagName("utc")[0].textContent);
+            var rtt = parseInt(xml.getElementsByTagName("rtt")[0].textContent);
+            var end = performance.now();
+            return serverTime + (rtt + (end - start)) / 1000;
+        }
+
+        // Calculate and return offset of local clock to external time.
+        async function syncClock() {
+            // synchronize local time in UTC
+            var latencyTarget = 20;  // seconds
+            var serverClock = await getTime();
+            var localClock = Math.round(Date.now() / 1000);
+            return serverClock - localClock;
+        }
+
+        // Awaitable sleep helper function.
+        async function sleep(milliseconds) {
+            await new Promise(resolve => setTimeout(resolve, milliseconds))
+        }
+
+        // Get the timestamp of the stream start time from the URL.
+        function getStartTime() {
+            var queryString = new URLSearchParams(window.location.search);
+            return parseInt(queryString.get("start"));
+        }
+
+        // Configure the hls.js player.
+        // Returns when the hls.js player is ready to play video.
+        async function initHlsPlayer(video) {
+            await new Promise(resolve => {
+                var hostname = window.location.hostname;
+                var streamname = window.location.pathname.split("/")[2];
+                var video = document.getElementById("stream");
+                var videoSrc = `http://${hostname}/hls/${streamname}.m3u8`;
+
+                if (Hls.isSupported()) {
+                    var hls = new Hls();
+
+                    hls.attachMedia(video);
+                    hls.on(Hls.Events.MEDIA_ATTACHED, function() {
+                        hls.loadSource(videoSrc);
+                    });
+                    hls.on(Hls.Events.MANIFEST_PARSED, resolve);
+                    hls.on(Hls.Events.ERROR, function(event, data) {
+                        if (data.fatal) {
+                            switch (data.type) {
+                                case Hls.ErrorTypes.NETWORK_ERROR:
+                                    hls.startLoad();
+                                    break;
+                                case Hls.ErrorTypes.MEDIA_ERROR:
+                                    hls.recoverMediaError();
+                                    break;
+                                default:
+                                    hls.destroy();
+                                    break;
+                            }
+                        }
+                    });
+                } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+                    video.src = videoSrc;
+                    video.addEventListener("loadmetadata", resolve);
+                }
+            });
+        }
+
+        // Jump the video to the live position discontinuously.
+        function seekToLivePosition(video, clockOffset, startTime) {
+            var expectedTimestamp = (Date.now()/1000 + clockOffset) - startTime;
+            video.currentTime = expectedTimestamp;
+        }
+
+        // Compare live position to the video's current position.
+        // If we're outside of a certain synchronization tolerance, adjust the
+        // playback speed slightly to compensate, and wait until we've caught
+        // up to the live position.
+        async function correctToLivePosition(video, clockOffset, startTime) {
+            var tolerance = 1;     // +|- seconds from live position
+            var hysteresis = 0.1;  // how fast to change video playback
+            var checkPeriod = 5;   // how long to wait between checks (seconds)
+            var expected = (Date.now()/1000 + clockOffset) - startTime;
+
+            // if this is positive, we're too far ahead of the live position
+            // if this is negative, we're too far behind the live position
+            var diff = video.currentTime - expected;
+
+            if (Math.abs(diff) > tolerance) {
+                // take corrective action
+                var rate = 1 - Math.sign(diff) * hysteresis;
+                video.playbackRate = rate;  // video seconds / real seconds
+
+                console.log("correcting sync");
+                console.log("new playback rate:", rate);
+
+                // calculate how much time is needed to catch up
+                var wait = diff / (1 - rate);
+                console.log("waiting", wait, "seconds for synchronization");
+
+                await sleep(wait * 1000);
+                video.playbackRate = 1;
+                console.log("sync complete");
+            }
+
+            await sleep(checkPeriod * 1000);
+            correctToLivePosition(video, clockOffset, startTime);
+        }
+
+        // main function; execution starts here
+        (async () => {
+            var video = document.getElementById("stream");
+            var clockOffset = await syncClock();
+            var startTime = getStartTime();
+
+            await initHlsPlayer(video);
+            console.log("HLS player is ready");
+
+            var expectedTimestamp = (Date.now()/1000 + clockOffset) - startTime;
+            console.log(expectedTimestamp);
+
+            if (expectedTimestamp < 0) {
+                var waitSeconds = -expectedTimestamp;
+                console.log("stream starting in", waitSeconds, "(s)");
+                await sleep(waitSeconds * 1000);
+            } else {
+                console.log("stream ongoing, current ts:", expectedTimestamp);
+                seekToLivePosition(video, clockOffset, startTime);
+            }
+
+            video.play();
+            
+            // future "play" events should seek to the latest stream position
+            video.addEventListener("play", () => {
+                seekToLivePosition(video, clockOffset, startTime);
+            });
+
+            // make sure the stream stays in sync
+            correctToLivePosition(video, clockOffset, startTime);
+        })();
+    </script>
+</body>
+</html>
